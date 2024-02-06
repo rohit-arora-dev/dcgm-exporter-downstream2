@@ -1,11 +1,14 @@
 package cmd
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +66,8 @@ const (
 	CLIWebConfigFile            = "web-config-file"
 	CLIXIDCountWindowSize       = "xid-count-window-size"
 	CLIReplaceBlanksInModelName = "replace-blanks-in-model-name"
+	CLIEnableDCGMLog            = "enable-dcgm-log"
+	CLIDCGMLogLevel             = "dcgm-log-level"
 )
 
 func NewApp(buildVersion ...string) *cli.App {
@@ -187,8 +192,20 @@ func NewApp(buildVersion ...string) *cli.App {
 			Name:    CLIReplaceBlanksInModelName,
 			Aliases: []string{"rbmn"},
 			Value:   false,
-			Usage:   "Replaces every blank space in the GPU model name with a dash, ensuring a continuous, space-free identifier.",
+			Usage:   "Replace every blank space in the GPU model name with a dash, ensuring a continuous, space-free identifier.",
 			EnvVars: []string{"DCGM_EXPORTER_REPLACE_BLANKS_IN_MODEL_NAME"},
+		},
+		&cli.BoolFlag{
+			Name:    CLIEnableDCGMLog,
+			Value:   false,
+			Usage:   "Enable writing DCGM logs to standard output (stdout).",
+			EnvVars: []string{"DCGM_EXPORTER_ENABLE_DCGM_LOG"},
+		},
+		&cli.StringFlag{
+			Name:    CLIDCGMLogLevel,
+			Value:   dcgmexporter.DCGMDbgLvlNone,
+			Usage:   "Specify the DCGM log verbosity level. This parameter is effective only when the '--enable-dcgm-log' option is set to 'true'. Possible values: NONE, FATAL, ERROR, WARN, INFO, DEBUG and VERB",
+			EnvVars: []string{"DCGM_EXPORTER_DCGM_LOG_LEVEL"},
 		},
 	}
 
@@ -221,6 +238,54 @@ func newOSWatcher(sigs ...os.Signal) chan os.Signal {
 
 func action(c *cli.Context) error {
 restart:
+	// Clone Stdout to origStdout.
+	origStdout, err := syscall.Dup(syscall.Stdout)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Clone the pipe's writer to the actual Stdout descriptor; from this point
+	// on, writes to Stdout will go to w.
+	if err = syscall.Dup2(int(w.Fd()), syscall.Stdout); err != nil {
+		log.Fatal(err)
+	}
+
+	// Write log entries to the original stdout
+	devTTY := os.NewFile(uintptr(origStdout), "/dev/tty")
+	logrus.SetOutput(devTTY)
+
+	go func() {
+		devTTY := os.NewFile(uintptr(origStdout), "/dev/tty")
+		logger := logrus.New()
+		logger.Out = devTTY
+		logger.Level = logrus.GetLevel()
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			logEntry := scanner.Text()
+			parsedLogEntry, err := parseLogEntry(logEntry)
+			if err != nil {
+				log.Fatalf("Failed to parse log entry: %v", err)
+			}
+			entry := logrus.NewEntry(logger)
+			entry.WithField("dcgm_level", parsedLogEntry.Level).Info(parsedLogEntry.Message)
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("Error reading from pipe: %v", err)
+		}
+	}()
+
+	defer func() {
+		w.Close()
+		syscall.Close(syscall.Stdout)
+		// Restore original Stdout.
+		syscall.Dup2(origStdout, syscall.Stdout)
+		syscall.Close(origStdout)
+	}()
 
 	logrus.Info("Starting dcgm-exporter")
 	config, err := contextToConfig(c)
@@ -236,6 +301,12 @@ restart:
 			logrus.Fatal(err)
 		}
 	} else {
+
+		if config.EnableDCGMLog {
+			os.Setenv("__DCGM_DBG_FILE", "-")
+			os.Setenv("__DCGM_DBG_LVL", config.DCGMLogLevel)
+		}
+
 		cleanup, err := dcgm.Init(dcgm.Embedded)
 		defer cleanup()
 		if err != nil {
@@ -406,6 +477,11 @@ func contextToConfig(c *cli.Context) (*dcgmexporter.Config, error) {
 		return nil, err
 	}
 
+	dcgmLogLevel := c.String(CLIDCGMLogLevel)
+	if !slices.Contains(dcgmexporter.DCGMDbgLvlValues, dcgmLogLevel) {
+		return nil, fmt.Errorf("Invalid %s parameter value: %s", CLIDCGMLogLevel, dcgmLogLevel)
+	}
+
 	return &dcgmexporter.Config{
 		CollectorsFile:           c.String(CLIFieldsFile),
 		Address:                  c.String(CLIAddress),
@@ -426,5 +502,37 @@ func contextToConfig(c *cli.Context) (*dcgmexporter.Config, error) {
 		WebConfigFile:            c.String(CLIWebConfigFile),
 		XIDCountWindowSize:       c.Int(CLIXIDCountWindowSize),
 		ReplaceBlanksInModelName: c.Bool(CLIReplaceBlanksInModelName),
+		EnableDCGMLog:            c.Bool(CLIEnableDCGMLog),
+		DCGMLogLevel:             dcgmLogLevel,
+	}, nil
+}
+
+// LogEntry represents the structured form of the parsed log entry.
+type LogEntry struct {
+	Timestamp time.Time
+	Level     string
+	Message   string
+}
+
+// parseLogEntry takes a log entry string and returns a structured LogEntry object.
+func parseLogEntry(entry string) (*LogEntry, error) {
+	// Split the entry by spaces, taking care to not split the function call and its arguments.
+	fields := strings.Fields(entry)
+
+	// Parse the timestamp.
+	timestamp, err := time.Parse("2006-01-02 15:04:05.000", fields[0]+" "+fields[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse timestamp: %v", err)
+	}
+
+	level := fields[2]
+
+	// Reconstruct the string from the fourth field onwards to deal with function calls and arguments.
+	remainder := strings.Join(fields[4:], " ")
+
+	return &LogEntry{
+		Timestamp: timestamp,
+		Level:     level,
+		Message:   remainder,
 	}, nil
 }

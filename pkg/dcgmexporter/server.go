@@ -22,8 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/logging"
 	"github.com/gorilla/mux"
-	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/sirupsen/logrus"
 )
@@ -67,8 +67,12 @@ func NewMetricsServer(c *Config, metrics chan string, registry *Registry) (*Metr
 
 func (s *MetricsServer) Run(stop chan interface{}, wg *sync.WaitGroup) {
 	defer wg.Done()
-	promlogConfig := &promlog.Config{}
-	logger := promlog.New(promlogConfig)
+	// Initialize your logrus logger
+	logrusLogger := logrus.New()
+	logrusLogger.SetLevel(logrus.GetLevel())
+
+	// Wrap the logrus logger with the LogrusAdapter
+	logger := logging.NewLogrusAdapter(logrusLogger)
 
 	var httpwg sync.WaitGroup
 	httpwg.Add(1)

@@ -80,6 +80,8 @@ type Config struct {
 	WebConfigFile            string
 	XIDCountWindowSize       int
 	ReplaceBlanksInModelName bool
+	EnableDCGMLog            bool
+	DCGMLogLevel             string
 }
 
 type Transform interface {
