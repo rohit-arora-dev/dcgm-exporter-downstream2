@@ -1,10 +1,9 @@
 package cmd
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"runtime"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dcgm-exporter/pkg/dcgmexporter"
+	"github.com/NVIDIA/dcgm-exporter/pkg/stdout"
 	"github.com/NVIDIA/go-dcgm/pkg/dcgm"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
@@ -237,165 +237,123 @@ func newOSWatcher(sigs ...os.Signal) chan os.Signal {
 }
 
 func action(c *cli.Context) error {
-restart:
-	// Clone Stdout to origStdout.
-	origStdout, err := syscall.Dup(syscall.Stdout)
-	if err != nil {
-		log.Fatal(err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return stdout.Capture(ctx, func() error {
+	restart:
+		logrus.Info("Starting dcgm-exporter")
+		config, err := contextToConfig(c)
+		if err != nil {
+			return err
+		}
 
-	r, w, err := os.Pipe()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Clone the pipe's writer to the actual Stdout descriptor; from this point
-	// on, writes to Stdout will go to w.
-	if err = syscall.Dup2(int(w.Fd()), syscall.Stdout); err != nil {
-		log.Fatal(err)
-	}
-
-	// Write log entries to the original stdout
-	devTTY := os.NewFile(uintptr(origStdout), "/dev/tty")
-	logrus.SetOutput(devTTY)
-
-	go func() {
-		devTTY := os.NewFile(uintptr(origStdout), "/dev/tty")
-		logger := logrus.New()
-		logger.Out = devTTY
-		logger.Level = logrus.GetLevel()
-		scanner := bufio.NewScanner(r)
-		for scanner.Scan() {
-			logEntry := scanner.Text()
-			parsedLogEntry, err := parseLogEntry(logEntry)
+		if config.UseRemoteHE {
+			logrus.Info("Attemping to connect to remote hostengine at ", config.RemoteHEInfo)
+			cleanup, err := dcgm.Init(dcgm.Standalone, config.RemoteHEInfo, "0")
+			defer cleanup()
 			if err != nil {
-				log.Fatalf("Failed to parse log entry: %v", err)
+				logrus.Fatal(err)
 			}
-			entry := logrus.NewEntry(logger)
-			entry.WithField("dcgm_level", parsedLogEntry.Level).Info(parsedLogEntry.Message)
+		} else {
+
+			if config.EnableDCGMLog {
+				os.Setenv("__DCGM_DBG_FILE", "-")
+				os.Setenv("__DCGM_DBG_LVL", config.DCGMLogLevel)
+			}
+
+			cleanup, err := dcgm.Init(dcgm.Embedded)
+			defer cleanup()
+			if err != nil {
+				logrus.Fatal(err)
+			}
 		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("Error reading from pipe: %v", err)
+		logrus.Info("DCGM successfully initialized!")
+
+		dcgm.FieldsInit()
+		defer dcgm.FieldsTerm()
+
+		var groups []dcgm.MetricGroup
+		groups, err = dcgm.GetSupportedMetricGroups(0)
+		if err != nil {
+			config.CollectDCP = false
+			logrus.Info("Not collecting DCP metrics: ", err)
+		} else {
+			logrus.Info("Collecting DCP Metrics")
+			config.MetricGroups = groups
 		}
-	}()
 
-	defer func() {
-		w.Close()
-		syscall.Close(syscall.Stdout)
-		// Restore original Stdout.
-		syscall.Dup2(origStdout, syscall.Stdout)
-		syscall.Close(origStdout)
-	}()
+		counters, exporterCounters, err := dcgmexporter.ExtractCounters(config)
+		if err != nil {
+			logrus.Fatal(err)
+		}
 
-	logrus.Info("Starting dcgm-exporter")
-	config, err := contextToConfig(c)
-	if err != nil {
-		return err
-	}
+		// Copy labels from counters to exporterCounters
+		for i := range counters {
+			if counters[i].PromType == "label" {
+				exporterCounters = append(exporterCounters, counters[i])
+			}
+		}
 
-	if config.UseRemoteHE {
-		logrus.Info("Attemping to connect to remote hostengine at ", config.RemoteHEInfo)
-		cleanup, err := dcgm.Init(dcgm.Standalone, config.RemoteHEInfo, "0")
+		hostname, err := dcgmexporter.GetHostname(config)
+		if err != nil {
+			return err
+		}
+
+		ch := make(chan string, 10)
+
+		pipeline, cleanup, err := dcgmexporter.NewMetricsPipeline(config, counters, hostname, dcgmexporter.NewDCGMCollector)
 		defer cleanup()
 		if err != nil {
 			logrus.Fatal(err)
 		}
-	} else {
 
-		if config.EnableDCGMLog {
-			os.Setenv("__DCGM_DBG_FILE", "-")
-			os.Setenv("__DCGM_DBG_LVL", config.DCGMLogLevel)
+		cRegistry := dcgmexporter.NewRegistry()
+
+		if dcgmexporter.IsdcgmExpXIDErrorsCountEnabled(exporterCounters) {
+			xidCollector, err := dcgmexporter.NewXIDCollector(config, exporterCounters, hostname)
+			if err != nil {
+				logrus.Fatal(err)
+			}
+
+			defer func() {
+				xidCollector.Cleanup()
+			}()
+
+			cRegistry.Register(xidCollector)
 		}
 
-		cleanup, err := dcgm.Init(dcgm.Embedded)
+		server, cleanup, err := dcgmexporter.NewMetricsServer(config, ch, cRegistry)
 		defer cleanup()
 		if err != nil {
-			logrus.Fatal(err)
+			return err
 		}
-	}
-	logrus.Info("DCGM successfully initialized!")
 
-	dcgm.FieldsInit()
-	defer dcgm.FieldsTerm()
+		var wg sync.WaitGroup
+		stop := make(chan interface{})
 
-	var groups []dcgm.MetricGroup
-	groups, err = dcgm.GetSupportedMetricGroups(0)
-	if err != nil {
-		config.CollectDCP = false
-		logrus.Info("Not collecting DCP metrics: ", err)
-	} else {
-		logrus.Info("Collecting DCP Metrics")
-		config.MetricGroups = groups
-	}
+		wg.Add(1)
+		go pipeline.Run(ch, stop, &wg)
 
-	counters, exporterCounters, err := dcgmexporter.ExtractCounters(config)
-	if err != nil {
-		logrus.Fatal(err)
-	}
+		wg.Add(1)
+		go server.Run(stop, &wg)
 
-	// Copy labels from counters to exporterCounters
-	for i := range counters {
-		if counters[i].PromType == "label" {
-			exporterCounters = append(exporterCounters, counters[i])
-		}
-	}
+		sigs := newOSWatcher(syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
 
-	hostname, err := dcgmexporter.GetHostname(config)
-	if err != nil {
-		return err
-	}
+		sig := <-sigs
 
-	ch := make(chan string, 10)
+		close(stop)
+		cancel()
 
-	pipeline, cleanup, err := dcgmexporter.NewMetricsPipeline(config, counters, hostname, dcgmexporter.NewDCGMCollector)
-	defer cleanup()
-	if err != nil {
-		logrus.Fatal(err)
-	}
-
-	cRegistry := dcgmexporter.NewRegistry()
-
-	if dcgmexporter.IsdcgmExpXIDErrorsCountEnabled(exporterCounters) {
-		xidCollector, err := dcgmexporter.NewXIDCollector(config, exporterCounters, hostname)
+		err = dcgmexporter.WaitWithTimeout(&wg, time.Second*2)
 		if err != nil {
 			logrus.Fatal(err)
 		}
 
-		defer func() {
-			xidCollector.Cleanup()
-		}()
+		if sig == syscall.SIGHUP {
+			goto restart
+		}
 
-		cRegistry.Register(xidCollector)
-	}
-
-	server, cleanup, err := dcgmexporter.NewMetricsServer(config, ch, cRegistry)
-	defer cleanup()
-	if err != nil {
-		return err
-	}
-
-	var wg sync.WaitGroup
-	stop := make(chan interface{})
-
-	wg.Add(1)
-	go pipeline.Run(ch, stop, &wg)
-
-	wg.Add(1)
-	go server.Run(stop, &wg)
-
-	sigs := newOSWatcher(syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
-	sig := <-sigs
-	close(stop)
-	err = dcgmexporter.WaitWithTimeout(&wg, time.Second*2)
-	if err != nil {
-		logrus.Fatal(err)
-	}
-
-	if sig == syscall.SIGHUP {
-		goto restart
-	}
-
-	return nil
+		return nil
+	})
 }
 
 func parseDeviceOptions(devices string) (dcgmexporter.DeviceOptions, error) {
@@ -504,35 +462,5 @@ func contextToConfig(c *cli.Context) (*dcgmexporter.Config, error) {
 		ReplaceBlanksInModelName: c.Bool(CLIReplaceBlanksInModelName),
 		EnableDCGMLog:            c.Bool(CLIEnableDCGMLog),
 		DCGMLogLevel:             dcgmLogLevel,
-	}, nil
-}
-
-// LogEntry represents the structured form of the parsed log entry.
-type LogEntry struct {
-	Timestamp time.Time
-	Level     string
-	Message   string
-}
-
-// parseLogEntry takes a log entry string and returns a structured LogEntry object.
-func parseLogEntry(entry string) (*LogEntry, error) {
-	// Split the entry by spaces, taking care to not split the function call and its arguments.
-	fields := strings.Fields(entry)
-
-	// Parse the timestamp.
-	timestamp, err := time.Parse("2006-01-02 15:04:05.000", fields[0]+" "+fields[1])
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse timestamp: %v", err)
-	}
-
-	level := fields[2]
-
-	// Reconstruct the string from the fourth field onwards to deal with function calls and arguments.
-	remainder := strings.Join(fields[4:], " ")
-
-	return &LogEntry{
-		Timestamp: timestamp,
-		Level:     level,
-		Message:   remainder,
 	}, nil
 }
