@@ -1,4 +1,4 @@
-# DCGM-Exporter
+# DCGM-Exporter-donwstream2
 
 This repository contains the DCGM-Exporter project. It exposes GPU metrics exporter for [Prometheus](https://prometheus.io/) leveraging [NVIDIA DCGM](https://developer.nvidia.com/dcgm).
 
