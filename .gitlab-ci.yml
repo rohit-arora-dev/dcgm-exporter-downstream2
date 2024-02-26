@@ -1,0 +1,12 @@
+yaml
+stages:
+  - smoke
+
+smoke:
+  stage: smoke
+  image: golang:1.21
+  only:
+    - main
+  script:
+    - make binary
+    - make check-format
